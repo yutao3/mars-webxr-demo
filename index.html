@@ -39,7 +39,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 // ====== DATA SETTINGS ======
 const metersPerPixel = 0.0625; // 6.25 cm/px
 const ZMIN = 0;
-const ZMAX = 85.655;
+const ZMAX = 97;
 const ZMID = 0.5*(ZMIN+ZMAX);
 
 // ====== RENDERER / SCENE ======
@@ -147,7 +147,7 @@ const hM  = hPx * metersPerPixel;
 console.log(`[Mars-WebXR] ${wPx}×${hPx} px  →  ${wM.toFixed(2)}×${hM.toFixed(2)} m  Z:[${ZMIN},${ZMAX}]`);
 
 // ====== TERRAIN ======
-const segX = 256, segY = Math.max(2, Math.round(segX * (hPx / wPx)));
+const segX = 512, segY = Math.max(2, Math.round(segX * (hPx / wPx)));
 const geo = new THREE.PlaneGeometry(wM, hM, segX, segY);
 geo.rotateX(-Math.PI/2);
 
