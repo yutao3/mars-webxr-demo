@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <title>Mars WebXR Demo</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="icon" href="data:,">
   <style>
     html,body { margin:0; height:100%; overflow:hidden; background:#000; }
     canvas { display:block; }
@@ -11,7 +12,12 @@
       position:fixed; left:12px; bottom:12px; right:12px;
       color:#ddd; font-family:system-ui, sans-serif; font-size:14px; opacity:.9;
       background:rgba(0,0,0,.35); padding:8px 10px; border-radius:8px;
-      line-height:1.35;
+      line-height:1.35; z-index:10;
+    }
+    #hud {
+      position:fixed; right:12px; top:12px; z-index:10;
+      background:rgba(0,0,0,.45); color:#eee; font:12px system-ui,sans-serif;
+      padding:8px 10px; border-radius:8px; min-width:200px;
     }
   </style>
 
@@ -28,21 +34,31 @@
 <body>
 <div id="hint">
   Desktop: drag = look, <b>WASD/←→↑↓</b> = move, <b>P</b> = screenshot, <b>1/2</b> = sun azimuth, <b>3/4</b> = sun elevation.<br/>
-  VR: Left stick = move. (Snap-turn removed.)
+  VR: Left stick = move (auto ground-follow). Spawn at centre, eye ≈ terrain + eyeHeight.
 </div>
+<div id="hud">h: –, eyeY: –</div>
 
 <script type="module">
 import * as THREE from 'three';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
-// ====== DATA SETTINGS ======
+/* -------- HUD -------- */
+const hud = document.getElementById('hud');
+function updateHUD(h, eyeY) {
+  if (!isFinite(h) || !isFinite(eyeY)) return;
+  hud.textContent = `h: ${h.toFixed(2)} m   eyeY: ${eyeY.toFixed(2)} m`;
+}
+
+/* -------- DATA SETTINGS -------- */
 const metersPerPixel = 0.0625; // 6.25 cm/px
 const ZMIN = 0;
-const ZMAX = 97;
-const ZMID = 0.5*(ZMIN+ZMAX);
+const ZMAX = 97;               // set per patch
+const eyeHeight = 3;           // you set this to 3 m
+const segX = 512;              // mesh resolution across width
+let   segY = segX;             // computed after we know aspect
 
-// ====== RENDERER / SCENE ======
+/* -------- RENDERER / SCENE -------- */
 const renderer = new THREE.WebGLRenderer({ antialias:true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
@@ -51,68 +67,48 @@ renderer.xr.setReferenceSpaceType('local-floor');
 document.body.appendChild(renderer.domElement);
 document.body.appendChild(VRButton.createButton(renderer));
 
-// --- SKY that cannot fail ---
-const MARTIAN_SKY = 0xC7926F;    // warm dusty pink/brown
-const MARTIAN_HAZE = 0xD9B38A;   // butterscotch horizon
+const MARTIAN_SKY  = 0xC7926F;
+const MARTIAN_HAZE = 0xD9B38A;
 const scene = new THREE.Scene();
-// 1) strong guarantee: set background colour
 scene.background = new THREE.Color(MARTIAN_SKY);
-// 2) add light fog for haze
-scene.fog = new THREE.Fog(MARTIAN_HAZE, 200, 2000);
+scene.fog        = new THREE.Fog(MARTIAN_HAZE, 200, 2000);
 
-// (OPTIONAL) soft gradient skydome on top of the background colour
+// World group (moved in VR; stays at origin on desktop)
+const world = new THREE.Group();
+scene.add(world);
+
+// Skydome (follows viewer)
 let sky = null;
 {
   const skyGeo = new THREE.SphereGeometry(5000, 32, 16);
-  skyGeo.scale(-1, 1, 1); // view from inside
+  skyGeo.scale(-1, 1, 1);
   const skyMat = new THREE.ShaderMaterial({
     side: THREE.BackSide, depthWrite:false, depthTest:false,
-    uniforms: {
-      top:    { value: new THREE.Color(0xC2876A) },
-      bottom: { value: new THREE.Color(0xD9B38A) },
-      power:  { value: 1.5 }
-    },
+    uniforms: { top:{value:new THREE.Color(0xC2876A)}, bottom:{value:new THREE.Color(0xD9B38A)}, power:{value:1.5} },
     vertexShader: `
       varying vec3 vWorld;
-      void main(){
-        vec4 wPos = modelMatrix * vec4(position,1.0);
-        vWorld = wPos.xyz;
-        gl_Position = projectionMatrix * viewMatrix * wPos;
-      }
-    `,
+      void main(){ vec4 wPos = modelMatrix * vec4(position,1.0); vWorld = wPos.xyz;
+                   gl_Position = projectionMatrix * viewMatrix * wPos; }`,
     fragmentShader: `
-      varying vec3 vWorld;
-      uniform vec3 top, bottom;
-      uniform float power;
-      void main(){
-        float h = clamp(normalize(vWorld).y, 0.0, 1.0);
-        float t = pow(h, power);
-        vec3 col = mix(bottom, top, t);
-        gl_FragColor = vec4(col, 1.0);
-      }
-    `
+      varying vec3 vWorld; uniform vec3 top, bottom; uniform float power;
+      void main(){ float h = clamp(normalize(vWorld).y, 0.0, 1.0);
+                   float t = pow(h, power); gl_FragColor = vec4(mix(bottom, top, t), 1.0); }`
   });
   sky = new THREE.Mesh(skyGeo, skyMat);
-  sky.renderOrder = -1; // render first
+  sky.renderOrder = -1;
   scene.add(sky);
 }
 
-// ====== CAMERA & CONTROLS ======
+/* -------- CAMERA & CONTROLS -------- */
 const camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.01, 100000);
-// For desktop, keep camera at root (NOT parented) to avoid conflicts with OrbitControls.
-camera.position.set(0, ZMID + 1.6, 300);
 scene.add(camera);
-
-// OrbitControls (desktop only)
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
-controls.target.set(0, ZMID, 0);
 
-// VR movement uses a separate rig (only moved during VR)
-const rig = new THREE.Group();
-scene.add(rig);
+/* -------- VR state -------- */
+let playerX = 0, playerZ = 0;
 
-// ====== LIGHTS ======
+/* -------- LIGHTS -------- */
 const hemi = new THREE.HemisphereLight(0xFFE7CF, 0x3a2a24, 0.55);
 scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xFFF2E0, 1.1);
@@ -128,51 +124,152 @@ function updateSun() {
 }
 updateSun();
 
-// ====== LOAD TEXTURES ======
+/* -------- LOAD TEXTURES -------- */
 const loader = new THREE.TextureLoader();
-const [heightTex, colorTex] = await Promise.all([
-  loader.loadAsync('./dtm.png'),
+const [heightImg, colorTex] = await Promise.all([
+  new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = './dtm.png';
+  }),
   loader.loadAsync('./image.jpg')
 ]);
-heightTex.colorSpace = THREE.NoColorSpace;
-heightTex.wrapS = heightTex.wrapT = THREE.ClampToEdgeWrapping;
-colorTex.wrapS   = colorTex.wrapT   = THREE.ClampToEdgeWrapping;
+
+// Note: we use the Image for CPU heights; the color texture maps normally (flipY default true)
+colorTex.wrapS = colorTex.wrapT = THREE.ClampToEdgeWrapping;
 colorTex.anisotropy = 8;
 
-// ====== DIMENSIONS ======
-const tmpImg = await new Promise(r => { const i=new Image(); i.onload=()=>r(i); i.src='./dtm.png'; });
-const wPx = tmpImg.naturalWidth, hPx = tmpImg.naturalHeight;
+/* -------- DIMENSIONS -------- */
+const wPx = heightImg.naturalWidth, hPx = heightImg.naturalHeight;
 const wM  = wPx * metersPerPixel;
 const hM  = hPx * metersPerPixel;
-console.log(`[Mars-WebXR] ${wPx}×${hPx} px  →  ${wM.toFixed(2)}×${hM.toFixed(2)} m  Z:[${ZMIN},${ZMAX}]`);
+segY = Math.max(2, Math.round(segX * (hPx / wPx)));
+console.log(`[Mars-WebXR] ${wPx}×${hPx} px → ${wM.toFixed(2)}×${hM.toFixed(2)} m  Z:[${ZMIN},${ZMAX}]  mesh=${segX}×${segY}`);
 
-// ====== TERRAIN ======
-const segX = 512, segY = Math.max(2, Math.round(segX * (hPx / wPx)));
+/* -------- HEIGHT SAMPLER (downscaled, bilinear) -------- */
+const heightSampler = await buildGraySampler(heightImg);
+
+async function buildGraySampler(img) {
+  // Downscale to ≤ 4096 long side for sharper peaks but still light
+  const maxSize = 4096;
+  let sw = img.naturalWidth, sh = img.naturalHeight;
+  if (Math.max(sw, sh) > maxSize) {
+    const s = maxSize / Math.max(sw, sh);
+    sw = Math.max(1, Math.round(sw * s));
+    sh = Math.max(1, Math.round(sh * s));
+  }
+  const c = document.createElement('canvas');
+  c.width = sw; c.height = sh;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0, sw, sh);
+  const data = ctx.getImageData(0, 0, sw, sh).data;
+  console.log(`[Sampler] canvas ${sw}×${sh} (downscaled from ${img.naturalWidth}×${img.naturalHeight})`);
+
+  function grayAtUV(u, v) {
+    // Textures in three.js default to flipY=true; emulate that here with (1 - v)
+    u = THREE.MathUtils.clamp(u, 0, 1);
+    v = THREE.MathUtils.clamp(v, 0, 1);
+    const fx = u * (sw - 1);
+    const fy = (1 - v) * (sh - 1);
+
+    const x0 = Math.floor(fx), y0 = Math.floor(fy);
+    const x1 = Math.min(sw - 1, x0 + 1);
+    const y1 = Math.min(sh - 1, y0 + 1);
+    const tx = fx - x0,       ty = fy - y0;
+
+    const idx = (x, y) => (y * sw + x) * 4;
+    const g00 = data[idx(x0, y0)];
+    const g10 = data[idx(x1, y0)];
+    const g01 = data[idx(x0, y1)];
+    const g11 = data[idx(x1, y1)];
+
+    const g0 = g00 * (1 - tx) + g10 * tx;
+    const g1 = g01 * (1 - tx) + g11 * tx;
+    return g0 * (1 - ty) + g1 * ty; // 0..255
+  }
+
+  return { grayAtUV };
+}
+
+/* -------- BUILD CPU-DISPLACED MESH -------- */
 const geo = new THREE.PlaneGeometry(wM, hM, segX, segY);
 geo.rotateX(-Math.PI/2);
 
+// Set vertex Y using heightmap (via UVs), and store a height grid we can reuse
+const pos = geo.attributes.position;
+const uvs = geo.attributes.uv;
+const verts = pos.count;
+const cols = segX + 1, rows = segY + 1;
+const heightGrid = new Float32Array(cols * rows); // row-major: (j * cols + i)
+
+for (let i = 0; i < verts; i++) {
+  const u = uvs.getX(i); // 0..1
+  const v = uvs.getY(i); // 0..1
+  const gray = heightSampler.grayAtUV(u, v);           // 0..255
+  const elev = ZMIN + (gray / 255) * (ZMAX - ZMIN);    // metres
+  pos.setY(i, elev);
+  // map vertex index to (ix, iy) on the grid
+  const ix = i % cols;
+  const iy = Math.floor(i / cols);
+  heightGrid[iy * cols + ix] = elev;
+}
+pos.needsUpdate = true;
+geo.computeVertexNormals();
+
 const material = new THREE.MeshStandardMaterial({
   map: colorTex,
-  displacementMap: heightTex,
-  displacementScale: (ZMAX - ZMIN),
-  displacementBias: ZMIN,
   metalness: 0.0,
   roughness: 1.0
 });
 const ground = new THREE.Mesh(geo, material);
-scene.add(ground);
+world.add(ground);
 
 // Helpers (optional)
-const axes = new THREE.AxesHelper(50); axes.position.y = ZMID; scene.add(axes);
-const grid = new THREE.GridHelper(Math.max(wM, hM), 20, 0x6aa6ff, 0x2a2a44); grid.position.y = ZMIN; scene.add(grid);
+const axes = new THREE.AxesHelper(50); axes.position.y = (ZMIN+ZMAX)*0.5; world.add(axes);
+const grid = new THREE.GridHelper(Math.max(wM, hM), 20, 0x6aa6ff, 0x2a2a44); grid.position.y = ZMIN; world.add(grid);
 
-// ====== DESKTOP MOVEMENT (smooth; no snap) ======
+/* -------- HEIGHT FROM MESH GRID (fast, exact vs what you see) -------- */
+function heightFromGridAtXZ(x, z) {
+  // Convert world x,z to UV (0..1)
+  const u = THREE.MathUtils.clamp((x / wM) + 0.5, 0, 1);
+  const v = THREE.MathUtils.clamp((z / hM) + 0.5, 0, 1);
+
+  // Map UV to grid cell indices
+  const gx = u * segX;         // 0..segX
+  const gz = v * segY;         // 0..segY
+  const x0 = Math.floor(gx), z0 = Math.floor(gz);
+  const x1 = Math.min(segX, x0 + 1);
+  const z1 = Math.min(segY, z0 + 1);
+  const tx = gx - x0, tz = gz - z0;
+
+  const idx = (ix, iz) => iz * (segX + 1) + ix;
+  const h00 = heightGrid[idx(x0, z0)];
+  const h10 = heightGrid[idx(x1, z0)];
+  const h01 = heightGrid[idx(x0, z1)];
+  const h11 = heightGrid[idx(x1, z1)];
+
+  const h0 = h00 * (1 - tx) + h10 * tx;
+  const h1 = h01 * (1 - tx) + h11 * tx;
+  return h0 * (1 - tz) + h1 * tz;
+}
+
+/* -------- INITIAL SPAWN at centre (eye above ground) -------- */
+const startX = 0;
+const startZ = 5; // tiny step forward so you can see
+const startH = heightFromGridAtXZ(startX, startZ);
+camera.position.set(startX, startH + eyeHeight, startZ);
+controls.target.set(0, startH, 0);
+playerX = startX; playerZ = startZ;
+updateHUD(startH, camera.position.y);
+
+/* -------- DESKTOP MOVEMENT (ground-follow) -------- */
 const keys = new Set();
 addEventListener('keydown', e => keys.add(e.code));
 addEventListener('keyup',   e => keys.delete(e.code));
+
 function desktopMove(dt) {
   const speed = 30; // m/s
-  // move in camera's facing plane
   const dir = new THREE.Vector3();
   camera.getWorldDirection(dir);
   dir.y = 0; dir.normalize();
@@ -186,55 +283,57 @@ function desktopMove(dt) {
 
   if (v.lengthSq() > 0) {
     v.normalize().multiplyScalar(speed * dt);
-    camera.position.add(v);
-    controls.target.add(v); // keep orbit pivot moving with you
+    camera.position.x += v.x;
+    camera.position.z += v.z;
+    controls.target.x += v.x;
+    controls.target.z += v.z;
   }
+
+  const h = heightFromGridAtXZ(camera.position.x, camera.position.z);
+  const desiredY = h + eyeHeight;
+  camera.position.y = THREE.MathUtils.lerp(camera.position.y, desiredY, 0.5);
+  controls.target.y = h;
+  updateHUD(h, camera.position.y);
 }
 
-// ====== VR LOCOMOTION (left stick only; no snap-turn) ======
+/* -------- VR LOCOMOTION (left stick; ground-follow via moving world) -------- */
 function vrMove(dt) {
   const session = renderer.xr.getSession?.();
   if (!session) return;
-
-  // Obtain the XR "viewer" transform (where the headset looks)
-  const refSpace = renderer.xr.getReferenceSpace();
-  const frame = renderer.xr.getFrame();
-  if (!refSpace || !frame) return;
 
   let leftAxes = null;
   for (const src of session.inputSources) {
     const gp = src.gamepad;
     if (!gp) continue;
-    if (src.handedness === 'left') {
-      leftAxes = gp.axes; // [x, y]
-    }
+    if (src.handedness === 'left') leftAxes = gp.axes; // [x, y]
   }
-  if (!leftAxes) return;
 
-  const moveX = leftAxes[0] || 0;
-  const moveY = leftAxes[1] || 0;
-  if (Math.hypot(moveX, moveY) < 0.05) return;
-
-  // Move along XR camera yaw
   const xrCam = renderer.xr.getCamera(camera);
   const m = xrCam.matrixWorld;
   const forward = new THREE.Vector3(m.elements[8], 0, m.elements[10]).normalize().negate(); // -Z
-  const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0,1,0));
+  const right   = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0,1,0));
 
-  const speed = 1.5; // m/s
-  const v = new THREE.Vector3().addScaledVector(right, moveX).addScaledVector(forward, -moveY)
-                               .normalize().multiplyScalar(speed * dt);
-  rig.position.add(v);
-  // move terrain + sky relative to rig? No—rig is separate; we offset camera root by rig using xr's parent.
-  // three.js attaches the XR camera under the scene; we simulate motion by moving the rig AND the terrain scene root:
-  // simplest: move the whole scene opposite to v (like world-relative). But that also moves the sky; good.
-  // However, since our camera is controlled by XR, easiest is to move the "ground" and helpers opposite to v:
-  ground.position.sub(v);
-  grid.position.sub(v);
-  axes.position.sub(v);
+  if (leftAxes) {
+    const moveX = leftAxes[0] || 0;
+    const moveY = leftAxes[1] || 0;
+    const mag = Math.hypot(moveX, moveY);
+    if (mag >= 0.05) {
+      const speed = 1.5;
+      const v = new THREE.Vector3()
+        .addScaledVector(right,  moveX)
+        .addScaledVector(forward,-moveY)
+        .normalize().multiplyScalar(speed * dt);
+      playerX += v.x;
+      playerZ += v.z;
+    }
+  }
+
+  const h = heightFromGridAtXZ(playerX, playerZ);
+  world.position.set(-playerX, -h, -playerZ); // keep ground at floor (y=0)
+  updateHUD(h, eyeHeight);
 }
 
-// ====== SUN CONTROLS + SCREENSHOT ======
+/* -------- SUN CONTROLS + SCREENSHOT -------- */
 addEventListener('keydown', (e)=>{
   if (e.key === '1') { sunAz -= 0.05; updateSun(); }
   if (e.key === '2') { sunAz += 0.05; updateSun(); }
@@ -248,7 +347,7 @@ addEventListener('keydown', (e)=>{
   }
 });
 
-// ====== RESIZE & LOOP ======
+/* -------- RESIZE & LOOP -------- */
 addEventListener('resize', ()=>{
   camera.aspect = innerWidth/innerHeight;
   camera.updateProjectionMatrix();
@@ -256,27 +355,30 @@ addEventListener('resize', ()=>{
 });
 
 renderer.xr.addEventListener('sessionstart', ()=>{
-  // disable OrbitControls while in VR to avoid fighting with head tracking
   controls.enabled = false;
+  // align VR player with current desktop XZ
+  playerX = camera.position.x;
+  playerZ = camera.position.z;
+  const h = heightFromGridAtXZ(playerX, playerZ);
+  world.position.set(-playerX, -h, -playerZ);
+  updateHUD(h, eyeHeight);
 });
 renderer.xr.addEventListener('sessionend', ()=>{
   controls.enabled = true;
+  world.position.set(0,0,0);
 });
 
 const clock = new THREE.Clock();
 renderer.setAnimationLoop(()=>{
   const dt = Math.min(0.05, clock.getDelta());
 
-  // keep skydome centered (if present)
-  if (sky) {
-    // center on camera (desktop) or XR viewer (VR)
-    const pos = renderer.xr.isPresenting ? renderer.xr.getCamera(camera).position : camera.position;
-    sky.position.copy(pos);
-  }
+  // keep skydome centred on viewer
+  const viewer = renderer.xr.isPresenting ? renderer.xr.getCamera(camera) : camera;
+  sky.position.copy(viewer.position);
 
   if (!renderer.xr.isPresenting) {
-    controls.update();
     desktopMove(dt);
+    controls.update();
   } else {
     vrMove(dt);
   }
