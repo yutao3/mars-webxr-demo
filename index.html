@@ -17,7 +17,7 @@
     #hud {
       position:fixed; right:12px; top:12px; z-index:10;
       background:rgba(0,0,0,.45); color:#eee; font:12px system-ui,sans-serif;
-      padding:8px 10px; border-radius:8px; min-width:200px;
+      padding:8px 10px; border-radius:8px; min-width:220px;
     }
   </style>
 
@@ -34,7 +34,7 @@
 <body>
 <div id="hint">
   Desktop: drag = look, <b>WASD/←→↑↓</b> = move, <b>P</b> = screenshot, <b>1/2</b> = sun azimuth, <b>3/4</b> = sun elevation.<br/>
-  VR: Left stick = move (auto ground-follow). Spawn at centre, eye ≈ terrain + eyeHeight.
+  VR: <b>Trigger</b>=aim+teleport, <b>Left stick</b>=move, <b>Left squeeze</b>=sun azimuth –, <b>Right squeeze</b>=sun azimuth +, <b>LS click</b>=sun elev –, <b>RS click</b>=sun elev +.
 </div>
 <div id="hud">h: –, eyeY: –</div>
 
@@ -42,6 +42,7 @@
 import * as THREE from 'three';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 /* -------- HUD -------- */
 const hud = document.getElementById('hud');
@@ -54,18 +55,27 @@ function updateHUD(h, eyeY) {
 const metersPerPixel = 0.0625; // 6.25 cm/px
 const ZMIN = 0;
 const ZMAX = 97;               // set per patch
-const eyeHeight = 3;           // you set this to 3 m
-const segX = 512;              // mesh resolution across width
-let   segY = segX;             // computed after we know aspect
+const eyeHeight = 3;           // your preference
+const segX = 512;
+let segY = segX;
 
-/* -------- RENDERER / SCENE -------- */
-const renderer = new THREE.WebGLRenderer({ antialias:true });
+/* -------- RENDERER / SCENE (color/tone mapping fixed) -------- */
+const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:false });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.xr.enabled = true;
 renderer.xr.setReferenceSpaceType('local-floor');
+
+/* Color management & tone mapping: brighten mobile/VR */
+renderer.outputColorSpace = THREE.SRGBColorSpace;               // ensure sRGB output
+renderer.toneMapping = THREE.ACESFilmicToneMapping;             // consistent tonemapper
+renderer.toneMappingExposure = 1.25;                            // a bit brighter
+
 document.body.appendChild(renderer.domElement);
-document.body.appendChild(VRButton.createButton(renderer));
+document.body.appendChild(VRButton.createButton(renderer, {
+  requiredFeatures: ['local-floor'],
+  optionalFeatures: ['bounded-floor', 'hand-tracking', 'layers']
+}));
 
 const MARTIAN_SKY  = 0xC7926F;
 const MARTIAN_HAZE = 0xD9B38A;
@@ -108,11 +118,15 @@ controls.enableDamping = true;
 /* -------- VR state -------- */
 let playerX = 0, playerZ = 0;
 
-/* -------- LIGHTS -------- */
-const hemi = new THREE.HemisphereLight(0xFFE7CF, 0x3a2a24, 0.55);
+/* -------- LIGHTS (a bit stronger/fill for mobile) -------- */
+const hemi = new THREE.HemisphereLight(0xFFE7CF, 0x3a2a24, 0.8); // was 0.55
 scene.add(hemi);
-const sun = new THREE.DirectionalLight(0xFFF2E0, 1.1);
+const sun = new THREE.DirectionalLight(0xFFF2E0, 1.6);           // was 1.1
+sun.castShadow = false;
 scene.add(sun);
+const ambient = new THREE.AmbientLight(0xffffff, 0.15);          // gentle fill
+scene.add(ambient);
+
 let sunAz = 0.7, sunEl = 0.9;
 function updateSun() {
   const r = 1.0;
@@ -127,16 +141,12 @@ updateSun();
 /* -------- LOAD TEXTURES -------- */
 const loader = new THREE.TextureLoader();
 const [heightImg, colorTex] = await Promise.all([
-  new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = reject;
-    img.src = './dtm.png';
-  }),
+  new Promise((resolve, reject) => { const img = new Image(); img.onload=()=>resolve(img); img.onerror=reject; img.src='./dtm.png'; }),
   loader.loadAsync('./image.jpg')
 ]);
 
-// Note: we use the Image for CPU heights; the color texture maps normally (flipY default true)
+// map color in sRGB explicitly (helps Safari)
+colorTex.colorSpace = THREE.SRGBColorSpace;
 colorTex.wrapS = colorTex.wrapT = THREE.ClampToEdgeWrapping;
 colorTex.anisotropy = 8;
 
@@ -149,9 +159,7 @@ console.log(`[Mars-WebXR] ${wPx}×${hPx} px → ${wM.toFixed(2)}×${hM.toFixed(2
 
 /* -------- HEIGHT SAMPLER (downscaled, bilinear) -------- */
 const heightSampler = await buildGraySampler(heightImg);
-
 async function buildGraySampler(img) {
-  // Downscale to ≤ 4096 long side for sharper peaks but still light
   const maxSize = 4096;
   let sw = img.naturalWidth, sh = img.naturalHeight;
   if (Math.max(sw, sh) > maxSize) {
@@ -167,28 +175,20 @@ async function buildGraySampler(img) {
   console.log(`[Sampler] canvas ${sw}×${sh} (downscaled from ${img.naturalWidth}×${img.naturalHeight})`);
 
   function grayAtUV(u, v) {
-    // Textures in three.js default to flipY=true; emulate that here with (1 - v)
     u = THREE.MathUtils.clamp(u, 0, 1);
     v = THREE.MathUtils.clamp(v, 0, 1);
     const fx = u * (sw - 1);
-    const fy = (1 - v) * (sh - 1);
-
+    const fy = (1 - v) * (sh - 1); // flipY to match default texture sampling
     const x0 = Math.floor(fx), y0 = Math.floor(fy);
     const x1 = Math.min(sw - 1, x0 + 1);
     const y1 = Math.min(sh - 1, y0 + 1);
-    const tx = fx - x0,       ty = fy - y0;
-
+    const tx = fx - x0, ty = fy - y0;
     const idx = (x, y) => (y * sw + x) * 4;
-    const g00 = data[idx(x0, y0)];
-    const g10 = data[idx(x1, y0)];
-    const g01 = data[idx(x0, y1)];
-    const g11 = data[idx(x1, y1)];
-
+    const g00 = data[idx(x0, y0)], g10 = data[idx(x1, y0)], g01 = data[idx(x0, y1)], g11 = data[idx(x1, y1)];
     const g0 = g00 * (1 - tx) + g10 * tx;
     const g1 = g01 * (1 - tx) + g11 * tx;
     return g0 * (1 - ty) + g1 * ty; // 0..255
   }
-
   return { grayAtUV };
 }
 
@@ -196,22 +196,18 @@ async function buildGraySampler(img) {
 const geo = new THREE.PlaneGeometry(wM, hM, segX, segY);
 geo.rotateX(-Math.PI/2);
 
-// Set vertex Y using heightmap (via UVs), and store a height grid we can reuse
 const pos = geo.attributes.position;
 const uvs = geo.attributes.uv;
 const verts = pos.count;
 const cols = segX + 1, rows = segY + 1;
-const heightGrid = new Float32Array(cols * rows); // row-major: (j * cols + i)
+const heightGrid = new Float32Array(cols * rows);
 
 for (let i = 0; i < verts; i++) {
-  const u = uvs.getX(i); // 0..1
-  const v = uvs.getY(i); // 0..1
-  const gray = heightSampler.grayAtUV(u, v);           // 0..255
-  const elev = ZMIN + (gray / 255) * (ZMAX - ZMIN);    // metres
+  const u = uvs.getX(i), v = uvs.getY(i);
+  const gray = heightSampler.grayAtUV(u, v);
+  const elev = ZMIN + (gray / 255) * (ZMAX - ZMIN);
   pos.setY(i, elev);
-  // map vertex index to (ix, iy) on the grid
-  const ix = i % cols;
-  const iy = Math.floor(i / cols);
+  const ix = i % cols, iy = Math.floor(i / cols);
   heightGrid[iy * cols + ix] = elev;
 }
 pos.needsUpdate = true;
@@ -229,34 +225,25 @@ world.add(ground);
 const axes = new THREE.AxesHelper(50); axes.position.y = (ZMIN+ZMAX)*0.5; world.add(axes);
 const grid = new THREE.GridHelper(Math.max(wM, hM), 20, 0x6aa6ff, 0x2a2a44); grid.position.y = ZMIN; world.add(grid);
 
-/* -------- HEIGHT FROM MESH GRID (fast, exact vs what you see) -------- */
+/* -------- HEIGHT FROM MESH GRID -------- */
 function heightFromGridAtXZ(x, z) {
-  // Convert world x,z to UV (0..1)
   const u = THREE.MathUtils.clamp((x / wM) + 0.5, 0, 1);
   const v = THREE.MathUtils.clamp((z / hM) + 0.5, 0, 1);
-
-  // Map UV to grid cell indices
-  const gx = u * segX;         // 0..segX
-  const gz = v * segY;         // 0..segY
+  const gx = u * segX, gz = v * segY;
   const x0 = Math.floor(gx), z0 = Math.floor(gz);
   const x1 = Math.min(segX, x0 + 1);
   const z1 = Math.min(segY, z0 + 1);
   const tx = gx - x0, tz = gz - z0;
-
   const idx = (ix, iz) => iz * (segX + 1) + ix;
-  const h00 = heightGrid[idx(x0, z0)];
-  const h10 = heightGrid[idx(x1, z0)];
-  const h01 = heightGrid[idx(x0, z1)];
-  const h11 = heightGrid[idx(x1, z1)];
-
+  const h00 = heightGrid[idx(x0,z0)], h10 = heightGrid[idx(x1,z0)],
+        h01 = heightGrid[idx(x0,z1)], h11 = heightGrid[idx(x1,z1)];
   const h0 = h00 * (1 - tx) + h10 * tx;
   const h1 = h01 * (1 - tx) + h11 * tx;
   return h0 * (1 - tz) + h1 * tz;
 }
 
-/* -------- INITIAL SPAWN at centre (eye above ground) -------- */
-const startX = 0;
-const startZ = 5; // tiny step forward so you can see
+/* -------- INITIAL SPAWN -------- */
+const startX = 0, startZ = 5;
 const startH = heightFromGridAtXZ(startX, startZ);
 camera.position.set(startX, startH + eyeHeight, startZ);
 controls.target.set(0, startH, 0);
@@ -271,8 +258,7 @@ addEventListener('keyup',   e => keys.delete(e.code));
 function desktopMove(dt) {
   const speed = 30; // m/s
   const dir = new THREE.Vector3();
-  camera.getWorldDirection(dir);
-  dir.y = 0; dir.normalize();
+  camera.getWorldDirection(dir); dir.y = 0; dir.normalize();
   const right = new THREE.Vector3().crossVectors(dir, new THREE.Vector3(0,1,0)).negate();
 
   let v = new THREE.Vector3();
@@ -283,10 +269,8 @@ function desktopMove(dt) {
 
   if (v.lengthSq() > 0) {
     v.normalize().multiplyScalar(speed * dt);
-    camera.position.x += v.x;
-    camera.position.z += v.z;
-    controls.target.x += v.x;
-    controls.target.z += v.z;
+    camera.position.x += v.x; camera.position.z += v.z;
+    controls.target.x += v.x; controls.target.z += v.z;
   }
 
   const h = heightFromGridAtXZ(camera.position.x, camera.position.z);
@@ -296,7 +280,103 @@ function desktopMove(dt) {
   updateHUD(h, camera.position.y);
 }
 
-/* -------- VR LOCOMOTION (left stick; ground-follow via moving world) -------- */
+/* -------- VR: controllers, laser + teleport + movement + sun controls -------- */
+const controllerModelFactory = new XRControllerModelFactory();
+
+const controller0 = renderer.xr.getController(0);
+const controller1 = renderer.xr.getController(1);
+scene.add(controller0); scene.add(controller1);
+
+const grip0 = renderer.xr.getControllerGrip(0);
+const grip1 = renderer.xr.getControllerGrip(1);
+grip0.add(controllerModelFactory.createControllerModel(grip0));
+grip1.add(controllerModelFactory.createControllerModel(grip1));
+scene.add(grip0); scene.add(grip1);
+
+// Laser lines
+function makeLaser() {
+  const pts = [new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,-1)];
+  const geom = new THREE.BufferGeometry().setFromPoints(pts);
+  const mat  = new THREE.LineBasicMaterial({ color:0x00ffff });
+  const line = new THREE.Line(geom, mat);
+  line.name = 'laser';
+  line.scale.z = 10; // default length
+  return line;
+}
+controller0.add(makeLaser());
+controller1.add(makeLaser());
+
+const raycaster = new THREE.Raycaster();
+const teleportMarker = new THREE.Mesh(
+  new THREE.RingGeometry(0.25, 0.3, 32),
+  new THREE.MeshBasicMaterial({ color:0x00ffff, transparent:true, opacity:0.8, side:THREE.DoubleSide })
+);
+teleportMarker.rotation.x = -Math.PI/2;
+teleportMarker.visible = false;
+world.add(teleportMarker);
+
+// helper: raycast from a controller, return intersection with ground
+function intersectFromController(ctrl) {
+  const tempMat = new THREE.Matrix4().identity().extractRotation(ctrl.matrixWorld);
+  const dir = new THREE.Vector3(0,0,-1).applyMatrix4(tempMat).normalize();
+  const origin = new THREE.Vector3().setFromMatrixPosition(ctrl.matrixWorld);
+  raycaster.set(origin, dir);
+  const hits = raycaster.intersectObject(ground, true);
+  return hits.length ? hits[0] : null;
+}
+
+// Teleport with trigger: aim while pressed, teleport on release
+function setupTeleportFor(ctrl, isRight) {
+  ctrl.addEventListener('selectstart', () => {
+    const line = ctrl.getObjectByName('laser');
+    if (line) line.material.color.set(0xffaa00);
+  });
+  ctrl.addEventListener('selectend', () => {
+    const line = ctrl.getObjectByName('laser');
+    if (line) line.material.color.set(0x00ffff);
+    const hit = intersectFromController(ctrl);
+    if (hit) {
+      const p = hit.point; // world coordinates (affected by 'world' offset)
+      // convert back to playerX/Z in our coordinate frame:
+      // world is at (-playerX, -h, -playerZ), so the "true" player position becomes:
+      playerX = p.x + world.position.x;
+      playerZ = p.z + world.position.z;
+      const h = heightFromGridAtXZ(playerX, playerZ);
+      world.position.set(-playerX, -h, -playerZ);
+      teleportMarker.visible = true;
+      teleportMarker.position.set(p.x, p.y + 0.02, p.z);
+      setTimeout(()=> teleportMarker.visible=false, 400);
+      updateHUD(h, eyeHeight);
+    }
+  });
+  // While holding trigger, stretch laser to the hit point
+  ctrl.addEventListener('squeezestart', ()=>{}); // keep for symmetry if needed
+}
+setupTeleportFor(controller0, false);
+setupTeleportFor(controller1, true);
+
+// Sun controls via controller buttons (squeeze & stick clicks)
+function pollControllerButtons() {
+  const session = renderer.xr.getSession?.();
+  if (!session) return;
+  for (const src of session.inputSources) {
+    if (!src || !src.gamepad) continue;
+    const gp = src.gamepad;
+    // Squeeze is typically button[1] on Touch; stick click often [3]
+    const squeeze    = gp.buttons[1]?.pressed;
+    const stickClick = gp.buttons[3]?.pressed;
+
+    if (src.handedness === 'left') {
+      if (squeeze) { sunAz -= 0.02; updateSun(); }
+      if (stickClick) { sunEl = Math.max(0.05, sunEl - 0.02); updateSun(); }
+    } else if (src.handedness === 'right') {
+      if (squeeze) { sunAz += 0.02; updateSun(); }
+      if (stickClick) { sunEl = Math.min(1.3, sunEl + 0.02); updateSun(); }
+    }
+  }
+}
+
+// VR left-stick locomotion (world-relative)
 function vrMove(dt) {
   const session = renderer.xr.getSession?.();
   if (!session) return;
@@ -323,17 +403,31 @@ function vrMove(dt) {
         .addScaledVector(right,  moveX)
         .addScaledVector(forward,-moveY)
         .normalize().multiplyScalar(speed * dt);
-      playerX += v.x;
-      playerZ += v.z;
+      playerX += v.x; playerZ += v.z;
     }
   }
 
+  // keep ground at floor (y=0)
   const h = heightFromGridAtXZ(playerX, playerZ);
-  world.position.set(-playerX, -h, -playerZ); // keep ground at floor (y=0)
-  updateHUD(h, eyeHeight);
+  world.position.set(-playerX, -h, -playerZ);
+
+  // live laser length + marker preview (only when trigger is half-pressed? we’ll just show if intersecting)
+  [controller0, controller1].forEach(ctrl=>{
+    const line = ctrl.getObjectByName('laser');
+    if (!line) return;
+    const hit = intersectFromController(ctrl);
+    if (hit) {
+      const dist = hit.distance;
+      line.scale.z = Math.min(dist, 50);
+    } else {
+      line.scale.z = 10;
+    }
+  });
+
+  pollControllerButtons();
 }
 
-/* -------- SUN CONTROLS + SCREENSHOT -------- */
+/* -------- SUN CONTROLS + SCREENSHOT (desktop) -------- */
 addEventListener('keydown', (e)=>{
   if (e.key === '1') { sunAz -= 0.05; updateSun(); }
   if (e.key === '2') { sunAz += 0.05; updateSun(); }
@@ -382,6 +476,9 @@ renderer.setAnimationLoop(()=>{
   } else {
     vrMove(dt);
   }
+
+  // simple auto-exposure guard for very dark frames (optional)
+  // renderer.toneMappingExposure = THREE.MathUtils.lerp(renderer.toneMappingExposure, 1.25, 0.05);
 
   renderer.render(scene, camera);
 });
