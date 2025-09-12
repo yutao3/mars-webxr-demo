@@ -17,7 +17,13 @@
     #hud {
       position:fixed; right:12px; top:12px; z-index:10;
       background:rgba(0,0,0,.45); color:#eee; font:12px system-ui,sans-serif;
-      padding:8px 10px; border-radius:8px; min-width:220px;
+      padding:8px 10px; border-radius:8px; min-width:260px;
+      display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+    }
+    #hud b { font-weight:600 }
+    #hud button {
+      background:#1e1e1e; color:#eee; border:1px solid #555; border-radius:6px;
+      padding:4px 8px; cursor:pointer;
     }
   </style>
 
@@ -36,7 +42,10 @@
   Desktop: drag = look, <b>WASD/←→↑↓</b> = move, <b>P</b> = screenshot, <b>1/2</b> = sun azimuth, <b>3/4</b> = sun elevation.<br/>
   VR: <b>Trigger</b>=aim+teleport, <b>Left stick</b>=move, <b>Left squeeze</b>=sun azimuth –, <b>Right squeeze</b>=sun azimuth +, <b>LS click</b>=sun elev –, <b>RS click</b>=sun elev +.
 </div>
-<div id="hud">h: –, eyeY: –</div>
+<div id="hud">
+  <span id="hudText">h: –, eyeY: –</span>
+  <button id="toggleLit" title="Toggle lighting (PBR vs Unlit) [L]">Lighting: <b id="litMode">Auto</b></button>
+</div>
 
 <script type="module">
 import * as THREE from 'three';
@@ -45,10 +54,11 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 /* -------- HUD -------- */
-const hud = document.getElementById('hud');
+const hudText = document.getElementById('hudText');
+const litLabel = document.getElementById('litMode');
 function updateHUD(h, eyeY) {
   if (!isFinite(h) || !isFinite(eyeY)) return;
-  hud.textContent = `h: ${h.toFixed(2)} m   eyeY: ${eyeY.toFixed(2)} m`;
+  hudText.textContent = `h: ${h.toFixed(2)} m   eyeY: ${eyeY.toFixed(2)} m`;
 }
 
 /* -------- DATA SETTINGS -------- */
@@ -59,22 +69,27 @@ const eyeHeight = 3;           // your preference
 const segX = 512;
 let segY = segX;
 
-/* -------- RENDERER / SCENE (color/tone mapping fixed) -------- */
+// Detect mobile/Quest/iPad to default to Unlit (texture-only) for brightness parity
+const isMobile = /Android|iPhone|iPad|iPod|OculusBrowser|Quest/i.test(navigator.userAgent);
+let forceUnlit = isMobile ? true : false; // default: Unlit on mobile/VR, PBR on desktop
+litLabel.textContent = forceUnlit ? 'Unlit' : 'PBR';
+
+/* -------- RENDERER / SCENE (neutral; no global exposure hacks) -------- */
 const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:false });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.xr.enabled = true;
 renderer.xr.setReferenceSpaceType('local-floor');
 
-/* Color management & tone mapping: brighten mobile/VR */
-renderer.outputColorSpace = THREE.SRGBColorSpace;               // ensure sRGB output
-renderer.toneMapping = THREE.ACESFilmicToneMapping;             // consistent tonemapper
-renderer.toneMappingExposure = 1.25;                            // a bit brighter
+// Keep colors consistent across browsers
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+// No tone-mapping exposure bump; keep defaults:
+// renderer.toneMapping = THREE.NoToneMapping;
 
 document.body.appendChild(renderer.domElement);
 document.body.appendChild(VRButton.createButton(renderer, {
   requiredFeatures: ['local-floor'],
-  optionalFeatures: ['bounded-floor', 'hand-tracking', 'layers']
+  optionalFeatures: ['bounded-floor', 'layers']
 }));
 
 const MARTIAN_SKY  = 0xC7926F;
@@ -118,14 +133,11 @@ controls.enableDamping = true;
 /* -------- VR state -------- */
 let playerX = 0, playerZ = 0;
 
-/* -------- LIGHTS (a bit stronger/fill for mobile) -------- */
-const hemi = new THREE.HemisphereLight(0xFFE7CF, 0x3a2a24, 0.8); // was 0.55
-scene.add(hemi);
-const sun = new THREE.DirectionalLight(0xFFF2E0, 1.6);           // was 1.1
-sun.castShadow = false;
-scene.add(sun);
-const ambient = new THREE.AmbientLight(0xffffff, 0.15);          // gentle fill
-scene.add(ambient);
+/* -------- LIGHTS (moderate; used only in PBR mode) -------- */
+const hemi = new THREE.HemisphereLight(0xFFE7CF, 0x3a2a24, 0.6);
+const sun  = new THREE.DirectionalLight(0xFFF2E0, 1.2);
+const ambient = new THREE.AmbientLight(0xffffff, 0.1);
+scene.add(hemi, sun, ambient);
 
 let sunAz = 0.7, sunEl = 0.9;
 function updateSun() {
@@ -145,7 +157,6 @@ const [heightImg, colorTex] = await Promise.all([
   loader.loadAsync('./image.jpg')
 ]);
 
-// map color in sRGB explicitly (helps Safari)
 colorTex.colorSpace = THREE.SRGBColorSpace;
 colorTex.wrapS = colorTex.wrapT = THREE.ClampToEdgeWrapping;
 colorTex.anisotropy = 8;
@@ -213,12 +224,16 @@ for (let i = 0; i < verts; i++) {
 pos.needsUpdate = true;
 geo.computeVertexNormals();
 
-const material = new THREE.MeshStandardMaterial({
-  map: colorTex,
-  metalness: 0.0,
-  roughness: 1.0
-});
-const ground = new THREE.Mesh(geo, material);
+// --- MATERIALS: PBR vs Unlit (auto on mobile, toggle with [L]) ---
+function makePBR() {
+  return new THREE.MeshStandardMaterial({ map: colorTex, metalness:0.0, roughness:1.0 });
+}
+function makeUnlit() {
+  return new THREE.MeshBasicMaterial({ map: colorTex });
+}
+let terrainMaterial = forceUnlit ? makeUnlit() : makePBR();
+
+const ground = new THREE.Mesh(geo, terrainMaterial);
 world.add(ground);
 
 // Helpers (optional)
@@ -247,7 +262,7 @@ const startX = 0, startZ = 5;
 const startH = heightFromGridAtXZ(startX, startZ);
 camera.position.set(startX, startH + eyeHeight, startZ);
 controls.target.set(0, startH, 0);
-playerX = startX; playerZ = startZ;
+let playerX = startX, playerZ = startZ;
 updateHUD(startH, camera.position.y);
 
 /* -------- DESKTOP MOVEMENT (ground-follow) -------- */
@@ -282,16 +297,15 @@ function desktopMove(dt) {
 
 /* -------- VR: controllers, laser + teleport + movement + sun controls -------- */
 const controllerModelFactory = new XRControllerModelFactory();
-
 const controller0 = renderer.xr.getController(0);
 const controller1 = renderer.xr.getController(1);
-scene.add(controller0); scene.add(controller1);
+scene.add(controller0, controller1);
 
 const grip0 = renderer.xr.getControllerGrip(0);
 const grip1 = renderer.xr.getControllerGrip(1);
 grip0.add(controllerModelFactory.createControllerModel(grip0));
 grip1.add(controllerModelFactory.createControllerModel(grip1));
-scene.add(grip0); scene.add(grip1);
+scene.add(grip0, grip1);
 
 // Laser lines
 function makeLaser() {
@@ -300,7 +314,7 @@ function makeLaser() {
   const mat  = new THREE.LineBasicMaterial({ color:0x00ffff });
   const line = new THREE.Line(geom, mat);
   line.name = 'laser';
-  line.scale.z = 10; // default length
+  line.scale.z = 10;
   return line;
 }
 controller0.add(makeLaser());
@@ -309,13 +323,13 @@ controller1.add(makeLaser());
 const raycaster = new THREE.Raycaster();
 const teleportMarker = new THREE.Mesh(
   new THREE.RingGeometry(0.25, 0.3, 32),
-  new THREE.MeshBasicMaterial({ color:0x00ffff, transparent:true, opacity:0.8, side:THREE.DoubleSide })
+  new THREE.MeshBasicMaterial({ color:0x00ffff, transparent:true, opacity:0.85, side:THREE.DoubleSide })
 );
 teleportMarker.rotation.x = -Math.PI/2;
 teleportMarker.visible = false;
 world.add(teleportMarker);
 
-// helper: raycast from a controller, return intersection with ground
+// Safe ray helper (ignore skydome)
 function intersectFromController(ctrl) {
   const tempMat = new THREE.Matrix4().identity().extractRotation(ctrl.matrixWorld);
   const dir = new THREE.Vector3(0,0,-1).applyMatrix4(tempMat).normalize();
@@ -325,47 +339,46 @@ function intersectFromController(ctrl) {
   return hits.length ? hits[0] : null;
 }
 
-// Teleport with trigger: aim while pressed, teleport on release
-function setupTeleportFor(ctrl, isRight) {
+// Teleport with trigger (FIXED: correct world->player coordinates)
+function setupTeleportFor(ctrl) {
   ctrl.addEventListener('selectstart', () => {
-    const line = ctrl.getObjectByName('laser');
-    if (line) line.material.color.set(0xffaa00);
+    const line = ctrl.getObjectByName('laser'); if (line) line.material.color.set(0xffaa00);
   });
   ctrl.addEventListener('selectend', () => {
-    const line = ctrl.getObjectByName('laser');
-    if (line) line.material.color.set(0x00ffff);
+    const line = ctrl.getObjectByName('laser'); if (line) line.material.color.set(0x00ffff);
     const hit = intersectFromController(ctrl);
     if (hit) {
-      const p = hit.point; // world coordinates (affected by 'world' offset)
-      // convert back to playerX/Z in our coordinate frame:
-      // world is at (-playerX, -h, -playerZ), so the "true" player position becomes:
-      playerX = p.x + world.position.x;
-      playerZ = p.z + world.position.z;
+      const p = hit.point; // scene coords (already include world offset)
+      // Convert to player frame: abs = p - worldOffset  (*** was + before; that caused over-teleport ***)
+      playerX = p.x - world.position.x;
+      playerZ = p.z - world.position.z;
+
+      // Clamp to valid dataset extents (stay within wM/2, hM/2, and sample height)
+      playerX = THREE.MathUtils.clamp(playerX, -wM/2 + 0.5,  wM/2 - 0.5);
+      playerZ = THREE.MathUtils.clamp(playerZ, -hM/2 + 0.5,  hM/2 - 0.5);
+
       const h = heightFromGridAtXZ(playerX, playerZ);
       world.position.set(-playerX, -h, -playerZ);
+
       teleportMarker.visible = true;
       teleportMarker.position.set(p.x, p.y + 0.02, p.z);
-      setTimeout(()=> teleportMarker.visible=false, 400);
+      setTimeout(()=> teleportMarker.visible=false, 350);
       updateHUD(h, eyeHeight);
     }
   });
-  // While holding trigger, stretch laser to the hit point
-  ctrl.addEventListener('squeezestart', ()=>{}); // keep for symmetry if needed
 }
-setupTeleportFor(controller0, false);
-setupTeleportFor(controller1, true);
+setupTeleportFor(controller0);
+setupTeleportFor(controller1);
 
-// Sun controls via controller buttons (squeeze & stick clicks)
+// Sun via controller buttons
 function pollControllerButtons() {
   const session = renderer.xr.getSession?.();
   if (!session) return;
   for (const src of session.inputSources) {
-    if (!src || !src.gamepad) continue;
     const gp = src.gamepad;
-    // Squeeze is typically button[1] on Touch; stick click often [3]
-    const squeeze    = gp.buttons[1]?.pressed;
-    const stickClick = gp.buttons[3]?.pressed;
-
+    if (!gp) continue;
+    const squeeze    = gp.buttons[1]?.pressed; // grip
+    const stickClick = gp.buttons[3]?.pressed; // stick
     if (src.handedness === 'left') {
       if (squeeze) { sunAz -= 0.02; updateSun(); }
       if (stickClick) { sunEl = Math.max(0.05, sunEl - 0.02); updateSun(); }
@@ -376,7 +389,7 @@ function pollControllerButtons() {
   }
 }
 
-// VR left-stick locomotion (world-relative)
+// VR left-stick locomotion
 function vrMove(dt) {
   const session = renderer.xr.getSession?.();
   if (!session) return;
@@ -385,7 +398,7 @@ function vrMove(dt) {
   for (const src of session.inputSources) {
     const gp = src.gamepad;
     if (!gp) continue;
-    if (src.handedness === 'left') leftAxes = gp.axes; // [x, y]
+    if (src.handedness === 'left') leftAxes = gp.axes;
   }
 
   const xrCam = renderer.xr.getCamera(camera);
@@ -394,8 +407,7 @@ function vrMove(dt) {
   const right   = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0,1,0));
 
   if (leftAxes) {
-    const moveX = leftAxes[0] || 0;
-    const moveY = leftAxes[1] || 0;
+    const moveX = leftAxes[0] || 0, moveY = leftAxes[1] || 0;
     const mag = Math.hypot(moveX, moveY);
     if (mag >= 0.05) {
       const speed = 1.5;
@@ -404,24 +416,22 @@ function vrMove(dt) {
         .addScaledVector(forward,-moveY)
         .normalize().multiplyScalar(speed * dt);
       playerX += v.x; playerZ += v.z;
+
+      // Keep within bounds
+      playerX = THREE.MathUtils.clamp(playerX, -wM/2 + 0.5,  wM/2 - 0.5);
+      playerZ = THREE.MathUtils.clamp(playerZ, -hM/2 + 0.5,  hM/2 - 0.5);
     }
   }
 
-  // keep ground at floor (y=0)
   const h = heightFromGridAtXZ(playerX, playerZ);
   world.position.set(-playerX, -h, -playerZ);
 
-  // live laser length + marker preview (only when trigger is half-pressed? we’ll just show if intersecting)
+  // Update laser lengths live
   [controller0, controller1].forEach(ctrl=>{
     const line = ctrl.getObjectByName('laser');
     if (!line) return;
     const hit = intersectFromController(ctrl);
-    if (hit) {
-      const dist = hit.distance;
-      line.scale.z = Math.min(dist, 50);
-    } else {
-      line.scale.z = 10;
-    }
+    line.scale.z = hit ? Math.min(hit.distance, 50) : 10;
   });
 
   pollControllerButtons();
@@ -439,7 +449,21 @@ addEventListener('keydown', (e)=>{
     a.href = renderer.domElement.toDataURL('image/png');
     a.click();
   }
+  if (e.key.toLowerCase() === 'l') {
+    toggleLighting();
+  }
 });
+
+/* -------- Lighting toggle button -------- */
+document.getElementById('toggleLit').addEventListener('click', toggleLighting);
+function toggleLighting() {
+  forceUnlit = !forceUnlit;
+  litLabel.textContent = forceUnlit ? 'Unlit' : 'PBR';
+  // swap material
+  const newMat = forceUnlit ? makeUnlit() : makePBR();
+  ground.material.dispose?.();
+  ground.material = newMat;
+}
 
 /* -------- RESIZE & LOOP -------- */
 addEventListener('resize', ()=>{
@@ -477,12 +501,8 @@ renderer.setAnimationLoop(()=>{
     vrMove(dt);
   }
 
-  // simple auto-exposure guard for very dark frames (optional)
-  // renderer.toneMappingExposure = THREE.MathUtils.lerp(renderer.toneMappingExposure, 1.25, 0.05);
-
   renderer.render(scene, camera);
 });
 </script>
 </body>
 </html>
-
