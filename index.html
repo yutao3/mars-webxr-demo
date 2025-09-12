@@ -74,18 +74,13 @@ const isMobile = /Android|iPhone|iPad|iPod|OculusBrowser|Quest/i.test(navigator.
 let forceUnlit = isMobile ? true : false; // default: Unlit on mobile/VR, PBR on desktop
 litLabel.textContent = forceUnlit ? 'Unlit' : 'PBR';
 
-/* -------- RENDERER / SCENE (neutral; no global exposure hacks) -------- */
+/* -------- RENDERER / SCENE -------- */
 const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:false });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.xr.enabled = true;
 renderer.xr.setReferenceSpaceType('local-floor');
-
-// Keep colors consistent across browsers
 renderer.outputColorSpace = THREE.SRGBColorSpace;
-// No tone-mapping exposure bump; keep defaults:
-// renderer.toneMapping = THREE.NoToneMapping;
-
 document.body.appendChild(renderer.domElement);
 document.body.appendChild(VRButton.createButton(renderer, {
   requiredFeatures: ['local-floor'],
@@ -130,10 +125,10 @@ scene.add(camera);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 
-/* -------- VR state -------- */
+/* -------- VR state (declare ONCE) -------- */
 let playerX = 0, playerZ = 0;
 
-/* -------- LIGHTS (moderate; used only in PBR mode) -------- */
+/* -------- LIGHTS (used for PBR mode) -------- */
 const hemi = new THREE.HemisphereLight(0xFFE7CF, 0x3a2a24, 0.6);
 const sun  = new THREE.DirectionalLight(0xFFF2E0, 1.2);
 const ambient = new THREE.AmbientLight(0xffffff, 0.1);
@@ -156,7 +151,6 @@ const [heightImg, colorTex] = await Promise.all([
   new Promise((resolve, reject) => { const img = new Image(); img.onload=()=>resolve(img); img.onerror=reject; img.src='./dtm.png'; }),
   loader.loadAsync('./image.jpg')
 ]);
-
 colorTex.colorSpace = THREE.SRGBColorSpace;
 colorTex.wrapS = colorTex.wrapT = THREE.ClampToEdgeWrapping;
 colorTex.anisotropy = 8;
@@ -262,7 +256,7 @@ const startX = 0, startZ = 5;
 const startH = heightFromGridAtXZ(startX, startZ);
 camera.position.set(startX, startH + eyeHeight, startZ);
 controls.target.set(0, startH, 0);
-let playerX = startX, playerZ = startZ;
+playerX = startX; playerZ = startZ;   // <-- FIX: assignment only (no 'let')
 updateHUD(startH, camera.position.y);
 
 /* -------- DESKTOP MOVEMENT (ground-follow) -------- */
@@ -329,7 +323,7 @@ teleportMarker.rotation.x = -Math.PI/2;
 teleportMarker.visible = false;
 world.add(teleportMarker);
 
-// Safe ray helper (ignore skydome)
+// Ray from controller
 function intersectFromController(ctrl) {
   const tempMat = new THREE.Matrix4().identity().extractRotation(ctrl.matrixWorld);
   const dir = new THREE.Vector3(0,0,-1).applyMatrix4(tempMat).normalize();
@@ -339,7 +333,7 @@ function intersectFromController(ctrl) {
   return hits.length ? hits[0] : null;
 }
 
-// Teleport with trigger (FIXED: correct world->player coordinates)
+// Teleport (fixed coordinate conversion + clamping)
 function setupTeleportFor(ctrl) {
   ctrl.addEventListener('selectstart', () => {
     const line = ctrl.getObjectByName('laser'); if (line) line.material.color.set(0xffaa00);
@@ -348,12 +342,11 @@ function setupTeleportFor(ctrl) {
     const line = ctrl.getObjectByName('laser'); if (line) line.material.color.set(0x00ffff);
     const hit = intersectFromController(ctrl);
     if (hit) {
-      const p = hit.point; // scene coords (already include world offset)
-      // Convert to player frame: abs = p - worldOffset  (*** was + before; that caused over-teleport ***)
-      playerX = p.x - world.position.x;
+      const p = hit.point; // scene coords (include world offset)
+      playerX = p.x - world.position.x;  // <-- correct sign
       playerZ = p.z - world.position.z;
 
-      // Clamp to valid dataset extents (stay within wM/2, hM/2, and sample height)
+      // clamp to dataset extents
       playerX = THREE.MathUtils.clamp(playerX, -wM/2 + 0.5,  wM/2 - 0.5);
       playerZ = THREE.MathUtils.clamp(playerZ, -hM/2 + 0.5,  hM/2 - 0.5);
 
@@ -417,7 +410,7 @@ function vrMove(dt) {
         .normalize().multiplyScalar(speed * dt);
       playerX += v.x; playerZ += v.z;
 
-      // Keep within bounds
+      // clamp to dataset extents
       playerX = THREE.MathUtils.clamp(playerX, -wM/2 + 0.5,  wM/2 - 0.5);
       playerZ = THREE.MathUtils.clamp(playerZ, -hM/2 + 0.5,  hM/2 - 0.5);
     }
@@ -459,7 +452,6 @@ document.getElementById('toggleLit').addEventListener('click', toggleLighting);
 function toggleLighting() {
   forceUnlit = !forceUnlit;
   litLabel.textContent = forceUnlit ? 'Unlit' : 'PBR';
-  // swap material
   const newMat = forceUnlit ? makeUnlit() : makePBR();
   ground.material.dispose?.();
   ground.material = newMat;
