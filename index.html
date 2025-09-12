@@ -145,7 +145,7 @@ const ambient = new THREE.AmbientLight(0xffffff, 0.1);
 scene.add(hemi, sun, ambient);
 
 // Sun angles: azimuth (around Y), elevation (from horizon up). Overhead would be ~1.571.
-let sunAz = 0.7, sunEl = 0.9;
+let sunAz = 0.7, sunEl = 1.5;
 function updateSun() {
   const r = 1.0;
   sun.position.set(
