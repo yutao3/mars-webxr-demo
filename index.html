@@ -69,9 +69,9 @@ const eyeHeight = 3;           // your preference
 const segX = 512;
 let segY = segX;
 
-// Detect mobile/Quest/iPad to default to Unlit (texture-only) for brightness parity
+// Detect mobile/Quest/iPad → default to Unlit there; PBR on desktop
 const isMobile = /Android|iPhone|iPad|iPod|OculusBrowser|Quest/i.test(navigator.userAgent);
-let forceUnlit = isMobile ? true : false; // default: Unlit on mobile/VR, PBR on desktop
+let forceUnlit = isMobile ? true : false;
 litLabel.textContent = forceUnlit ? 'Unlit' : 'PBR';
 
 /* -------- RENDERER / SCENE -------- */
@@ -80,7 +80,9 @@ renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.xr.enabled = true;
 renderer.xr.setReferenceSpaceType('local-floor');
+// Keep Three’s output in sRGB; we handle Unlit’s color inside the shader.
 renderer.outputColorSpace = THREE.SRGBColorSpace;
+
 document.body.appendChild(renderer.domElement);
 document.body.appendChild(VRButton.createButton(renderer, {
   requiredFeatures: ['local-floor'],
@@ -146,15 +148,30 @@ function updateSun() {
 }
 updateSun();
 
-/* -------- LOAD TEXTURES -------- */
-const loader = new THREE.TextureLoader();
-const [heightImg, colorTex] = await Promise.all([
+/* -------- LOAD IMAGES (height + color) -------- */
+const [heightImg, colorImg] = await Promise.all([
   new Promise((resolve, reject) => { const img = new Image(); img.onload=()=>resolve(img); img.onerror=reject; img.src='./dtm.png'; }),
-  loader.loadAsync('./image.jpg')
+  new Promise((resolve, reject) => { const img = new Image(); img.onload=()=>resolve(img); img.onerror=reject; img.src='./image.jpg'; })
 ]);
-colorTex.colorSpace = THREE.SRGBColorSpace;
-colorTex.wrapS = colorTex.wrapT = THREE.ClampToEdgeWrapping;
-colorTex.anisotropy = 8;
+
+/* -------- BUILD TWO COLOR TEXTURES (sRGB for PBR, Linear for Unlit) -------- */
+function makeTextureFromImage(img, colorSpace, mobileSafe=false) {
+  const tex = new THREE.Texture(img);
+  tex.flipY = true;
+  tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.colorSpace = colorSpace; // THREE.SRGBColorSpace or THREE.NoColorSpace
+  tex.anisotropy = 8;
+  if (mobileSafe) {
+    // Avoid mip/NPOT oddities on mobile GPUs
+    tex.generateMipmaps = false;
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+  }
+  tex.needsUpdate = true;
+  return tex;
+}
+const colorTexSRGB  = makeTextureFromImage(colorImg, THREE.SRGBColorSpace, isMobile);
+const colorTexLinear= makeTextureFromImage(colorImg, THREE.NoColorSpace,  isMobile);
 
 /* -------- DIMENSIONS -------- */
 const wPx = heightImg.naturalWidth, hPx = heightImg.naturalHeight;
@@ -219,17 +236,15 @@ for (let i = 0; i < verts; i++) {
 pos.needsUpdate = true;
 geo.computeVertexNormals();
 
-/* -------- MATERIALS: PBR vs UNLIT (with large fixed gain) -------- */
+/* -------- MATERIALS: PBR vs UNLIT (linear texture + big gain) -------- */
 function makePBR() {
-  return new THREE.MeshStandardMaterial({ map: colorTex, metalness:0.0, roughness:1.0 });
+  return new THREE.MeshStandardMaterial({ map: colorTexSRGB, metalness:0.0, roughness:1.0 });
 }
-
-// Unlit with strong brightness boost (gain x60), manual sRGB <-> linear
 function makeUnlitBoosted() {
   return new THREE.ShaderMaterial({
     uniforms: {
-      map:  { value: colorTex },
-      gain: { value: 60.0 } // strong boost as requested
+      map:  { value: colorTexLinear }, // linear (NoColorSpace) texture
+      gain: { value: 80.0 }            // big boost (tune if needed)
     },
     vertexShader: `
       varying vec2 vUv;
@@ -242,33 +257,38 @@ function makeUnlitBoosted() {
       uniform sampler2D map;
       uniform float gain;
 
-      // Manual sRGB <-> linear conversions (approx)
-      vec3 srgbToLinear(vec3 c) { return pow(c, vec3(2.2)); }
+      // We're sampling a linear (non-sRGB) texture.
+      // Apply gain in linear space, then convert to sRGB for output.
       vec3 linearToSrgb(vec3 c) { return pow(c, vec3(1.0/2.2)); }
 
       void main(){
-        vec4 tex = texture2D(map, vUv);
-        vec3 lin = srgbToLinear(tex.rgb);
-        lin *= gain;
+        vec4 tex = texture2D(map, vUv);   // linear sample
+        vec3 lin = tex.rgb * gain;        // strong brighten
         lin = clamp(lin, 0.0, 1.0);
-        vec3 srgb = linearToSrgb(lin);
+        vec3 srgb = linearToSrgb(lin);    // encode for display
         gl_FragColor = vec4(srgb, tex.a);
       }`,
     depthTest: true,
     depthWrite: true,
     transparent: false,
-    toneMapped: false // keep independent of renderer tone mapping
+    toneMapped: false // don't let renderer tone mapping touch it
   });
 }
 
-
 let terrainMaterial = forceUnlit ? makeUnlitBoosted() : makePBR();
 const ground = new THREE.Mesh(geo, terrainMaterial);
-world.add(ground);
+world.add(GPUCompliant(ground));
 
 // Helpers (optional)
 const axes = new THREE.AxesHelper(50); axes.position.y = (ZMIN+ZMAX)*0.5; world.add(axes);
 const grid = new THREE.GridHelper(Math.max(wM, hM), 20, 0x6aa6ff, 0x2a2a44); grid.position.y = ZMIN; world.add(grid);
+
+/* -------- Ensure material state is valid on all GPUs -------- */
+function GPUCompliant(mesh){
+  // Some mobile GPUs need this nudge at swap time:
+  mesh.material.needsUpdate = true;
+  return mesh;
+}
 
 /* -------- HEIGHT FROM MESH GRID -------- */
 function heightFromGridAtXZ(x, z) {
@@ -369,7 +389,7 @@ function intersectFromController(ctrl) {
   return hits.length ? hits[0] : null;
 }
 
-// Teleport (fixed coordinate conversion + clamping)
+// Teleport (correct world->player conversion + clamping)
 function setupTeleportFor(ctrl) {
   ctrl.addEventListener('selectstart', () => {
     const line = ctrl.getObjectByName('laser'); if (line) line.material.color.set(0xffaa00);
@@ -399,7 +419,7 @@ function setupTeleportFor(ctrl) {
 setupTeleportFor(controller0);
 setupTeleportFor(controller1);
 
-// Sun via controller buttons
+// Sun via controller buttons (PBR only; Unlit ignores lights)
 function pollControllerButtons() {
   const session = renderer.xr.getSession?.();
   if (!session) return;
@@ -489,7 +509,7 @@ function toggleLighting() {
   const newMat = forceUnlit ? makeUnlitBoosted() : makePBR();
   ground.material.dispose?.();
   ground.material = newMat;
-  ground.material.needsUpdate = true; // ensure it shows immediately
+  ground.material.needsUpdate = true; // ensure immediate recompile
 }
 
 /* -------- RESIZE & LOOP -------- */
