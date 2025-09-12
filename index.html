@@ -54,7 +54,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 /* -------- HUD -------- */
-const hudText  = document.getElementById('hudText');
+const hudText = document.getElementById('hudText');
 const litLabel = document.getElementById('litMode');
 function updateHUD(h, eyeY) {
   if (!isFinite(h) || !isFinite(eyeY)) return;
@@ -69,9 +69,9 @@ const eyeHeight = 3;           // your preference
 const segX = 512;
 let segY = segX;
 
-// Detect mobile/Quest/iPad → default to Unlit there; PBR on desktop
+// Detect mobile/Quest/iPad to default to Unlit (texture-only) for brightness parity
 const isMobile = /Android|iPhone|iPad|iPod|OculusBrowser|Quest/i.test(navigator.userAgent);
-let forceUnlit = isMobile ? true : false;
+let forceUnlit = isMobile ? true : false; // default: Unlit on mobile/VR, PBR on desktop
 litLabel.textContent = forceUnlit ? 'Unlit' : 'PBR';
 
 /* -------- RENDERER / SCENE -------- */
@@ -80,13 +80,14 @@ renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.xr.enabled = true;
 renderer.xr.setReferenceSpaceType('local-floor');
-// Keep Three’s output in sRGB; we handle Unlit’s color inside the shader.
 renderer.outputColorSpace = THREE.SRGBColorSpace;
-
+renderer.toneMapping = THREE.NoToneMapping; // explicit
 document.body.appendChild(renderer.domElement);
+
+// IMPORTANT: avoid WebXR Layers color-space quirks on some headsets
 document.body.appendChild(VRButton.createButton(renderer, {
   requiredFeatures: ['local-floor'],
-  optionalFeatures: ['bounded-floor', 'layers']
+  optionalFeatures: ['bounded-floor'] // ← removed 'layers'
 }));
 
 const MARTIAN_SKY  = 0xC7926F;
@@ -127,16 +128,15 @@ scene.add(camera);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 
-/* -------- VR state (declare once) -------- */
+/* -------- VR state (declare ONCE) -------- */
 let playerX = 0, playerZ = 0;
 
-/* -------- LIGHTS (PBR only) -------- */
+/* -------- LIGHTS (used for PBR mode) -------- */
 const hemi = new THREE.HemisphereLight(0xFFE7CF, 0x3a2a24, 0.6);
 const sun  = new THREE.DirectionalLight(0xFFF2E0, 1.2);
 const ambient = new THREE.AmbientLight(0xffffff, 0.1);
 scene.add(hemi, sun, ambient);
 
-// Sun angles: azimuth (around Y), elevation (from horizon up). Overhead ~1.571 rad.
 let sunAz = 0.7, sunEl = 0.9;
 function updateSun() {
   const r = 1.0;
@@ -148,30 +148,41 @@ function updateSun() {
 }
 updateSun();
 
-/* -------- LOAD IMAGES (height + color) -------- */
-const [heightImg, colorImg] = await Promise.all([
-  new Promise((resolve, reject) => { const img = new Image(); img.onload=()=>resolve(img); img.onerror=reject; img.src='./dtm.png'; }),
-  new Promise((resolve, reject) => { const img = new Image(); img.onload=()=>resolve(img); img.onerror=reject; img.src='./image.jpg'; })
-]);
+/* -------- LOAD TEXTURES -------- */
+const loader = new THREE.TextureLoader();
 
-/* -------- BUILD TWO COLOR TEXTURES (sRGB for PBR, Linear for Unlit) -------- */
-function makeTextureFromImage(img, colorSpace, mobileSafe=false) {
-  const tex = new THREE.Texture(img);
-  tex.flipY = true;
+// Normal PBR texture path (unchanged behaviour)
+const colorTexPBR = await loader.loadAsync('./image.jpg');
+colorTexPBR.colorSpace = THREE.SRGBColorSpace;
+colorTexPBR.wrapS = colorTexPBR.wrapT = THREE.ClampToEdgeWrapping;
+colorTexPBR.anisotropy = 8;
+
+// Unlit-safe texture: draw via 2D canvas to normalise to sRGB on Safari/Quest
+const colorTexUnlit = await loadSRGBCanvasTexture('./image.jpg', 4096 /*max*/);
+
+// Height image (for mesh displacement)
+const heightImg = await new Promise((resolve, reject) => {
+  const img = new Image(); img.onload=()=>resolve(img); img.onerror=reject; img.src='./dtm.png';
+});
+
+/* ---- helper: make a CanvasTexture that’s consistently sRGB across browsers ---- */
+async function loadSRGBCanvasTexture(url, maxSize=4096) {
+  const img = await new Promise((res, rej)=>{ const im=new Image(); im.onload=()=>res(im); im.onerror=rej; im.src=url; });
+  // clamp size (keeps memory sane on mobile)
+  let w = img.naturalWidth, h = img.naturalHeight;
+  if (Math.max(w,h) > maxSize) { const s = maxSize/Math.max(w,h); w = Math.round(w*s); h = Math.round(h*s); }
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  // 2D canvas is color-managed → we get consistent sRGB pixels
+  const ctx = c.getContext('2d');
+  ctx.drawImage(img, 0, 0, w, h);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
   tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
-  tex.colorSpace = colorSpace; // THREE.SRGBColorSpace or THREE.NoColorSpace
   tex.anisotropy = 8;
-  if (mobileSafe) {
-    // Avoid mip/NPOT oddities on mobile GPUs
-    tex.generateMipmaps = false;
-    tex.minFilter = THREE.LinearFilter;
-    tex.magFilter = THREE.LinearFilter;
-  }
-  tex.needsUpdate = true;
+  // match default flipY used by TextureLoader for non-GLTF images
+  tex.flipY = false;
   return tex;
 }
-const colorTexSRGB  = makeTextureFromImage(colorImg, THREE.SRGBColorSpace, isMobile);
-const colorTexLinear= makeTextureFromImage(colorImg, THREE.NoColorSpace,  isMobile);
 
 /* -------- DIMENSIONS -------- */
 const wPx = heightImg.naturalWidth, hPx = heightImg.naturalHeight;
@@ -236,59 +247,26 @@ for (let i = 0; i < verts; i++) {
 pos.needsUpdate = true;
 geo.computeVertexNormals();
 
-/* -------- MATERIALS: PBR vs UNLIT (linear texture + big gain) -------- */
+// --- MATERIALS: PBR vs Unlit (auto on mobile, toggle with [L]) ---
+// Keep PBR path exactly as before
 function makePBR() {
-  return new THREE.MeshStandardMaterial({ map: colorTexSRGB, metalness:0.0, roughness:1.0 });
-}
-function makeUnlitBoosted() {
-  return new THREE.ShaderMaterial({
-    uniforms: {
-      map:  { value: colorTexLinear }, // linear (NoColorSpace) texture
-      gain: { value: 80.0 }            // big boost (tune if needed)
-    },
-    vertexShader: `
-      varying vec2 vUv;
-      void main(){
-        vUv = uv;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
-      }`,
-    fragmentShader: `
-      varying vec2 vUv;
-      uniform sampler2D map;
-      uniform float gain;
-
-      // We're sampling a linear (non-sRGB) texture.
-      // Apply gain in linear space, then convert to sRGB for output.
-      vec3 linearToSrgb(vec3 c) { return pow(c, vec3(1.0/2.2)); }
-
-      void main(){
-        vec4 tex = texture2D(map, vUv);   // linear sample
-        vec3 lin = tex.rgb * gain;        // strong brighten
-        lin = clamp(lin, 0.0, 1.0);
-        vec3 srgb = linearToSrgb(lin);    // encode for display
-        gl_FragColor = vec4(srgb, tex.a);
-      }`,
-    depthTest: true,
-    depthWrite: true,
-    transparent: false,
-    toneMapped: false // don't let renderer tone mapping touch it
-  });
+  return new THREE.MeshStandardMaterial({ map: colorTexPBR, metalness:0.0, roughness:1.0 });
 }
 
-let terrainMaterial = forceUnlit ? makeUnlitBoosted() : makePBR();
+// Unlit path: use canvas-normalised sRGB texture, and bypass tone-mapping & fog
+function makeUnlit() {
+  const m = new THREE.MeshBasicMaterial({ map: colorTexUnlit, fog:false });
+  m.toneMapped = false; // be explicit; Basic is unlit
+  return m;
+}
+let terrainMaterial = forceUnlit ? makeUnlit() : makePBR();
+
 const ground = new THREE.Mesh(geo, terrainMaterial);
-world.add(GPUCompliant(ground));
+world.add(ground);
 
 // Helpers (optional)
 const axes = new THREE.AxesHelper(50); axes.position.y = (ZMIN+ZMAX)*0.5; world.add(axes);
 const grid = new THREE.GridHelper(Math.max(wM, hM), 20, 0x6aa6ff, 0x2a2a44); grid.position.y = ZMIN; world.add(grid);
-
-/* -------- Ensure material state is valid on all GPUs -------- */
-function GPUCompliant(mesh){
-  // Some mobile GPUs need this nudge at swap time:
-  mesh.material.needsUpdate = true;
-  return mesh;
-}
 
 /* -------- HEIGHT FROM MESH GRID -------- */
 function heightFromGridAtXZ(x, z) {
@@ -389,7 +367,7 @@ function intersectFromController(ctrl) {
   return hits.length ? hits[0] : null;
 }
 
-// Teleport (correct world->player conversion + clamping)
+// Teleport (fixed coordinate conversion + clamping)
 function setupTeleportFor(ctrl) {
   ctrl.addEventListener('selectstart', () => {
     const line = ctrl.getObjectByName('laser'); if (line) line.material.color.set(0xffaa00);
@@ -398,11 +376,10 @@ function setupTeleportFor(ctrl) {
     const line = ctrl.getObjectByName('laser'); if (line) line.material.color.set(0x00ffff);
     const hit = intersectFromController(ctrl);
     if (hit) {
-      const p = hit.point; // scene coords (include world offset)
+      const p = hit.point;
       playerX = p.x - world.position.x;
       playerZ = p.z - world.position.z;
 
-      // clamp to dataset extents
       playerX = THREE.MathUtils.clamp(playerX, -wM/2 + 0.5,  wM/2 - 0.5);
       playerZ = THREE.MathUtils.clamp(playerZ, -hM/2 + 0.5,  hM/2 - 0.5);
 
@@ -419,7 +396,7 @@ function setupTeleportFor(ctrl) {
 setupTeleportFor(controller0);
 setupTeleportFor(controller1);
 
-// Sun via controller buttons (PBR only; Unlit ignores lights)
+// Sun via controller buttons
 function pollControllerButtons() {
   const session = renderer.xr.getSession?.();
   if (!session) return;
@@ -466,7 +443,6 @@ function vrMove(dt) {
         .normalize().multiplyScalar(speed * dt);
       playerX += v.x; playerZ += v.z;
 
-      // clamp to dataset extents
       playerX = THREE.MathUtils.clamp(playerX, -wM/2 + 0.5,  wM/2 - 0.5);
       playerZ = THREE.MathUtils.clamp(playerZ, -hM/2 + 0.5,  hM/2 - 0.5);
     }
@@ -498,18 +474,19 @@ addEventListener('keydown', (e)=>{
     a.href = renderer.domElement.toDataURL('image/png');
     a.click();
   }
-  if (e.key.toLowerCase() === 'l') toggleLighting();
+  if (e.key.toLowerCase() === 'l') {
+    toggleLighting();
+  }
 });
 
-/* -------- Lighting toggle -------- */
+/* -------- Lighting toggle button -------- */
 document.getElementById('toggleLit').addEventListener('click', toggleLighting);
 function toggleLighting() {
   forceUnlit = !forceUnlit;
   litLabel.textContent = forceUnlit ? 'Unlit' : 'PBR';
-  const newMat = forceUnlit ? makeUnlitBoosted() : makePBR();
+  const newMat = forceUnlit ? makeUnlit() : makePBR();
   ground.material.dispose?.();
   ground.material = newMat;
-  ground.material.needsUpdate = true; // ensure immediate recompile
 }
 
 /* -------- RESIZE & LOOP -------- */
