@@ -17,14 +17,16 @@
     #hud {
       position:fixed; right:12px; top:12px; z-index:10;
       background:rgba(0,0,0,.45); color:#eee; font:12px system-ui,sans-serif;
-      padding:8px 10px; border-radius:8px; min-width:260px;
+      padding:8px 10px; border-radius:8px; min-width:280px;
       display:flex; gap:8px; align-items:center; flex-wrap:wrap;
     }
     #hud b { font-weight:600 }
-    #hud button {
+    #hud button, #hud input[type="range"] {
       background:#1e1e1e; color:#eee; border:1px solid #555; border-radius:6px;
       padding:4px 8px; cursor:pointer;
     }
+    #gainWrap { display:none; align-items:center; gap:6px; }
+    #gainWrap label { opacity:.9 }
   </style>
 
   <!-- Import map -->
@@ -45,6 +47,10 @@
 <div id="hud">
   <span id="hudText">h: –, eyeY: –</span>
   <button id="toggleLit" title="Toggle lighting (PBR vs Unlit) [L]">Lighting: <b id="litMode">Auto</b></button>
+  <span id="gainWrap">
+    <label>Brightness</label>
+    <input id="gain" type="range" min="0.8" max="3.0" step="0.05" value="1.8" />
+  </span>
 </div>
 
 <script type="module">
@@ -54,8 +60,10 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 /* -------- HUD -------- */
-const hudText = document.getElementById('hudText');
+const hudText  = document.getElementById('hudText');
 const litLabel = document.getElementById('litMode');
+const gainWrap = document.getElementById('gainWrap');
+const gainUI   = document.getElementById('gain');
 function updateHUD(h, eyeY) {
   if (!isFinite(h) || !isFinite(eyeY)) return;
   hudText.textContent = `h: ${h.toFixed(2)} m   eyeY: ${eyeY.toFixed(2)} m`;
@@ -72,7 +80,9 @@ let segY = segX;
 // Detect mobile/Quest/iPad to default to Unlit (texture-only) for brightness parity
 const isMobile = /Android|iPhone|iPad|iPod|OculusBrowser|Quest/i.test(navigator.userAgent);
 let forceUnlit = isMobile ? true : false; // default: Unlit on mobile/VR, PBR on desktop
+let brightnessGain = isMobile ? 1.8 : 1.2; // gentle on desktop if toggled, stronger on mobile
 litLabel.textContent = forceUnlit ? 'Unlit' : 'PBR';
+gainUI.value = String(brightnessGain);
 
 /* -------- RENDERER / SCENE -------- */
 const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:false });
@@ -125,15 +135,16 @@ scene.add(camera);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 
-/* -------- VR state (declare ONCE) -------- */
+/* -------- VR state -------- */
 let playerX = 0, playerZ = 0;
 
-/* -------- LIGHTS (used for PBR mode) -------- */
+/* -------- LIGHTS (used for PBR mode only) -------- */
 const hemi = new THREE.HemisphereLight(0xFFE7CF, 0x3a2a24, 0.6);
 const sun  = new THREE.DirectionalLight(0xFFF2E0, 1.2);
 const ambient = new THREE.AmbientLight(0xffffff, 0.1);
 scene.add(hemi, sun, ambient);
 
+// Sun angles: azimuth (around Y), elevation (from horizon up). Overhead would be ~1.571.
 let sunAz = 0.7, sunEl = 0.9;
 function updateSun() {
   const r = 1.0;
@@ -218,15 +229,46 @@ for (let i = 0; i < verts; i++) {
 pos.needsUpdate = true;
 geo.computeVertexNormals();
 
-// --- MATERIALS: PBR vs Unlit (auto on mobile, toggle with [L]) ---
+/* -------- MATERIALS: PBR vs UNLIT (with gain in Unlit) -------- */
 function makePBR() {
   return new THREE.MeshStandardMaterial({ map: colorTex, metalness:0.0, roughness:1.0 });
 }
-function makeUnlit() {
-  return new THREE.MeshBasicMaterial({ map: colorTex });
+// Unlit with brightness gain (sRGB-correct)
+function makeUnlitWithGain(gain=1.8) {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      map:  { value: colorTex },
+      gain: { value: gain }
+    },
+    vertexShader: `
+      varying vec2 vUv;
+      void main(){
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
+      }`,
+    fragmentShader: `
+      varying vec2 vUv;
+      uniform sampler2D map;
+      uniform float gain;
+      // three.js color space helpers
+      #include <common>
+      #include <color_space_pars_fragment>
+      void main(){
+        vec4 c = texture2D(map, vUv);
+        // decode sRGB -> linear, brighten, encode linear -> sRGB
+        c = SRGBToLinear(c);
+        c.rgb *= gain;
+        c = LinearToSRGB(c);
+        gl_FragColor = c;
+      }`,
+    transparent:false,
+    depthTest:true,
+    depthWrite:true,
+    toneMapped:false // keep independent from renderer tone mapping
+  });
 }
-let terrainMaterial = forceUnlit ? makeUnlit() : makePBR();
 
+let terrainMaterial = forceUnlit ? makeUnlitWithGain(brightnessGain) : makePBR();
 const ground = new THREE.Mesh(geo, terrainMaterial);
 world.add(ground);
 
@@ -256,7 +298,7 @@ const startX = 0, startZ = 5;
 const startH = heightFromGridAtXZ(startX, startZ);
 camera.position.set(startX, startH + eyeHeight, startZ);
 controls.target.set(0, startH, 0);
-playerX = startX; playerZ = startZ;   // <-- FIX: assignment only (no 'let')
+playerX = startX; playerZ = startZ;
 updateHUD(startH, camera.position.y);
 
 /* -------- DESKTOP MOVEMENT (ground-follow) -------- */
@@ -343,7 +385,7 @@ function setupTeleportFor(ctrl) {
     const hit = intersectFromController(ctrl);
     if (hit) {
       const p = hit.point; // scene coords (include world offset)
-      playerX = p.x - world.position.x;  // <-- correct sign
+      playerX = p.x - world.position.x;
       playerZ = p.z - world.position.z;
 
       // clamp to dataset extents
@@ -442,19 +484,37 @@ addEventListener('keydown', (e)=>{
     a.href = renderer.domElement.toDataURL('image/png');
     a.click();
   }
-  if (e.key.toLowerCase() === 'l') {
-    toggleLighting();
-  }
+  if (e.key.toLowerCase() === 'l') toggleLighting();
+  if (e.key === '[') adjustGain(-0.05);
+  if (e.key === ']') adjustGain(+0.05);
 });
 
-/* -------- Lighting toggle button -------- */
+/* -------- Lighting toggle + brightness control -------- */
 document.getElementById('toggleLit').addEventListener('click', toggleLighting);
+gainUI.addEventListener('input', ()=> { setGain(parseFloat(gainUI.value)); });
+
 function toggleLighting() {
   forceUnlit = !forceUnlit;
   litLabel.textContent = forceUnlit ? 'Unlit' : 'PBR';
-  const newMat = forceUnlit ? makeUnlit() : makePBR();
+  gainWrap.style.display = forceUnlit ? 'inline-flex' : 'none';
+
+  const newMat = forceUnlit ? makeUnlitWithGain(brightnessGain) : makePBR();
   ground.material.dispose?.();
   ground.material = newMat;
+}
+
+function setGain(g) {
+  brightnessGain = THREE.MathUtils.clamp(g, 0.5, 4.0);
+  const mat = ground.material;
+  if (mat.isShaderMaterial && mat.uniforms && mat.uniforms.gain) {
+    mat.uniforms.gain.value = brightnessGain;
+  }
+}
+
+function adjustGain(step) {
+  if (!forceUnlit) return;
+  setGain(brightnessGain + step);
+  gainUI.value = String(brightnessGain);
 }
 
 /* -------- RESIZE & LOOP -------- */
@@ -476,6 +536,7 @@ renderer.xr.addEventListener('sessionstart', ()=>{
 renderer.xr.addEventListener('sessionend', ()=>{
   controls.enabled = true;
   world.position.set(0,0,0);
+  // When exiting VR on a phone/tablet, keep whatever lighting you chose
 });
 
 const clock = new THREE.Clock();
@@ -495,6 +556,9 @@ renderer.setAnimationLoop(()=>{
 
   renderer.render(scene, camera);
 });
+
+// Show brightness slider only when Unlit is active
+gainWrap.style.display = forceUnlit ? 'inline-flex' : 'none';
 </script>
 </body>
 </html>
