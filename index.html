@@ -69,9 +69,11 @@ const eyeHeight = 3;           // your preference
 const segX = 512;
 let segY = segX;
 
-// Detect mobile/Quest/iPad to default to Unlit (texture-only) for brightness parity
-const isMobile = /Android|iPhone|iPad|iPod|OculusBrowser|Quest/i.test(navigator.userAgent);
-let forceUnlit = isMobile ? true : false; // default: Unlit on mobile/VR, PBR on desktop
+/* --- DEVICE DETECTION (Quest + iPad default to UNLIT) --- */
+const ua = navigator.userAgent || "";
+const isQuest = /OculusBrowser|Quest|Meta Quest/i.test(ua);
+const isIPadLike = /iPad/i.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+let forceUnlit = (isQuest || isIPadLike);
 litLabel.textContent = forceUnlit ? 'Unlit' : 'PBR';
 
 /* -------- RENDERER / SCENE -------- */
@@ -81,13 +83,13 @@ renderer.setSize(innerWidth, innerHeight);
 renderer.xr.enabled = true;
 renderer.xr.setReferenceSpaceType('local-floor');
 renderer.outputColorSpace = THREE.SRGBColorSpace;
-renderer.toneMapping = THREE.NoToneMapping; // explicit
+renderer.toneMapping = THREE.NoToneMapping;
 document.body.appendChild(renderer.domElement);
 
-// IMPORTANT: avoid WebXR Layers color-space quirks on some headsets
+// Avoid WebXR Layers colour-space quirks
 document.body.appendChild(VRButton.createButton(renderer, {
   requiredFeatures: ['local-floor'],
-  optionalFeatures: ['bounded-floor'] // ← removed 'layers'
+  optionalFeatures: ['bounded-floor']
 }));
 
 const MARTIAN_SKY  = 0xC7926F;
@@ -96,11 +98,11 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(MARTIAN_SKY);
 scene.fog        = new THREE.Fog(MARTIAN_HAZE, 200, 2000);
 
-// World group (moved in VR; stays at origin on desktop)
+// World group
 const world = new THREE.Group();
 scene.add(world);
 
-// Skydome (follows viewer)
+// Skydome
 let sky = null;
 {
   const skyGeo = new THREE.SphereGeometry(5000, 32, 16);
@@ -128,10 +130,10 @@ scene.add(camera);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 
-/* -------- VR state (declare ONCE) -------- */
+/* -------- VR state -------- */
 let playerX = 0, playerZ = 0;
 
-/* -------- LIGHTS (used for PBR mode) -------- */
+/* -------- LIGHTS (for PBR) -------- */
 const hemi = new THREE.HemisphereLight(0xFFE7CF, 0x3a2a24, 0.6);
 const sun  = new THREE.DirectionalLight(0xFFF2E0, 1.2);
 const ambient = new THREE.AmbientLight(0xffffff, 0.1);
@@ -151,36 +153,34 @@ updateSun();
 /* -------- LOAD TEXTURES -------- */
 const loader = new THREE.TextureLoader();
 
-// Normal PBR texture path (unchanged behaviour)
+// PBR map (unchanged, but explicitly align flipY to the sampler)
 const colorTexPBR = await loader.loadAsync('./image.jpg');
 colorTexPBR.colorSpace = THREE.SRGBColorSpace;
 colorTexPBR.wrapS = colorTexPBR.wrapT = THREE.ClampToEdgeWrapping;
 colorTexPBR.anisotropy = 8;
+colorTexPBR.flipY = true;       // <-- explicit, matches sampler
 
-// Unlit-safe texture: draw via 2D canvas to normalise to sRGB on Safari/Quest
+// Unlit-safe texture via Canvas (sRGB-normalised) — now also flipY = true
 const colorTexUnlit = await loadSRGBCanvasTexture('./image.jpg', 4096 /*max*/);
+colorTexUnlit.flipY = true;     // <-- critical: match PBR + height sampler
 
-// Height image (for mesh displacement)
+// Height image
 const heightImg = await new Promise((resolve, reject) => {
   const img = new Image(); img.onload=()=>resolve(img); img.onerror=reject; img.src='./dtm.png';
 });
 
-/* ---- helper: make a CanvasTexture that’s consistently sRGB across browsers ---- */
+/* ---- helper: CanvasTexture consistently sRGB ---- */
 async function loadSRGBCanvasTexture(url, maxSize=4096) {
   const img = await new Promise((res, rej)=>{ const im=new Image(); im.onload=()=>res(im); im.onerror=rej; im.src=url; });
-  // clamp size (keeps memory sane on mobile)
   let w = img.naturalWidth, h = img.naturalHeight;
   if (Math.max(w,h) > maxSize) { const s = maxSize/Math.max(w,h); w = Math.round(w*s); h = Math.round(h*s); }
   const c = document.createElement('canvas'); c.width = w; c.height = h;
-  // 2D canvas is color-managed → we get consistent sRGB pixels
-  const ctx = c.getContext('2d');
-  ctx.drawImage(img, 0, 0, w, h);
+  const ctx = c.getContext('2d'); ctx.drawImage(img, 0, 0, w, h);
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
   tex.anisotropy = 8;
-  // match default flipY used by TextureLoader for non-GLTF images
-  tex.flipY = false;
+  // NOTE: flipY set outside to keep behaviour explicit & consistent with PBR
   return tex;
 }
 
@@ -212,7 +212,7 @@ async function buildGraySampler(img) {
     u = THREE.MathUtils.clamp(u, 0, 1);
     v = THREE.MathUtils.clamp(v, 0, 1);
     const fx = u * (sw - 1);
-    const fy = (1 - v) * (sh - 1); // flipY to match default texture sampling
+    const fy = (1 - v) * (sh - 1); // flipY to match texture sampling (flipY = true)
     const x0 = Math.floor(fx), y0 = Math.floor(fy);
     const x1 = Math.min(sw - 1, x0 + 1);
     const y1 = Math.min(sh - 1, y0 + 1);
@@ -247,16 +247,13 @@ for (let i = 0; i < verts; i++) {
 pos.needsUpdate = true;
 geo.computeVertexNormals();
 
-// --- MATERIALS: PBR vs Unlit (auto on mobile, toggle with [L]) ---
-// Keep PBR path exactly as before
+/* --- MATERIALS: PBR vs Unlit (auto on Quest/iPad, toggle [L]) --- */
 function makePBR() {
   return new THREE.MeshStandardMaterial({ map: colorTexPBR, metalness:0.0, roughness:1.0 });
 }
-
-// Unlit path: use canvas-normalised sRGB texture, and bypass tone-mapping & fog
 function makeUnlit() {
   const m = new THREE.MeshBasicMaterial({ map: colorTexUnlit, fog:false });
-  m.toneMapped = false; // be explicit; Basic is unlit
+  m.toneMapped = false;
   return m;
 }
 let terrainMaterial = forceUnlit ? makeUnlit() : makePBR();
@@ -293,7 +290,7 @@ controls.target.set(0, startH, 0);
 playerX = startX; playerZ = startZ;
 updateHUD(startH, camera.position.y);
 
-/* -------- DESKTOP MOVEMENT (ground-follow) -------- */
+/* -------- DESKTOP MOVEMENT -------- */
 const keys = new Set();
 addEventListener('keydown', e => keys.add(e.code));
 addEventListener('keyup',   e => keys.delete(e.code));
@@ -323,7 +320,7 @@ function desktopMove(dt) {
   updateHUD(h, camera.position.y);
 }
 
-/* -------- VR: controllers, laser + teleport + movement + sun controls -------- */
+/* -------- VR: controllers & movement -------- */
 const controllerModelFactory = new XRControllerModelFactory();
 const controller0 = renderer.xr.getController(0);
 const controller1 = renderer.xr.getController(1);
@@ -367,7 +364,7 @@ function intersectFromController(ctrl) {
   return hits.length ? hits[0] : null;
 }
 
-// Teleport (fixed coordinate conversion + clamping)
+// Teleport
 function setupTeleportFor(ctrl) {
   ctrl.addEventListener('selectstart', () => {
     const line = ctrl.getObjectByName('laser'); if (line) line.material.color.set(0xffaa00);
