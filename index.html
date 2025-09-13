@@ -67,8 +67,10 @@ function updateHUD(h, eyeY) {
   hudText.textContent = `h: ${h.toFixed(2)} m   eyeY: ${eyeY.toFixed(2)} m`;
 }
 
-/* -------- SITE CONFIGS -------- */
-const metersPerPixel = 0.0625; // 6.25 cm/px (kept consistent for both sites as requested)
+/* -------- GLOBAL SETTINGS / SITES -------- */
+const metersPerPixel = 0.0625;   // 6.25 cm/px (both sites)
+const eyeHeight = 3;             // moved up so it's initialised before loadSite()
+
 const SITES = [
   { name:'Jezero Crater HiRISE super-3D', colorUrl:'./image.jpg',  dtmUrl:'./dtm.png',  ZMIN:0, ZMAX:97  },
   { name:'Oxia Planum CaSSIS super-3D',  colorUrl:'./image2.jpg', dtmUrl:'./dtm2.png', ZMIN:0, ZMAX:352 }
@@ -279,8 +281,7 @@ async function loadSite(idx) {
   pos.needsUpdate = true;
   geo.computeVertexNormals();
 
-  // swap ground mesh
-  const newMaterial = (forceUnlit ? makeUnlit : makePBR).call(null);
+  // swap textures -> current, then create material/mesh
   colorTexPBR_current?.dispose?.();
   colorTexUnlit_current?.dispose?.();
   colorTexPBR_current = colorTexPBR;
@@ -346,7 +347,6 @@ function heightFromGridAtXZ(x, z) {
 await loadSite(0);
 
 /* -------- DESKTOP MOVEMENT -------- */
-const eyeHeight = 3;
 const keys = new Set();
 addEventListener('keydown', e => keys.add(e.code));
 addEventListener('keyup',   e => keys.delete(e.code));
